@@ -116,18 +116,41 @@ def personalize(args):
     train_y = np.concatenate([replay_y, y_aug])
     print(f"Personalizing from {source} using {len(y_user)} user drawing(s),"
           f" {len(replay_x)} reference examples and {len(x_aug)} augmented corrections")
-    baseline = model.accuracy(data.x_test, data.y_test)
+    baseline_val = model.accuracy(data.x_val, data.y_val)
+    baseline_user = model.accuracy(x_user, y_user)
     hist = model.fit(train_x, train_y, x_val=data.x_val, y_val=data.y_val,
                      epochs=args.epochs, batch_size=128, lr=args.lr, patience=5,
                      seed=args.seed)
-    after = model.accuracy(data.x_test, data.y_test)
+    after_val = model.accuracy(data.x_val, data.y_val)
+    after_user = model.accuracy(x_user, y_user)
+    print(f"Validation accuracy: {baseline_val:.2%} -> {after_val:.2%}")
+    print(f"Own saved handwriting: {baseline_user:.2%} -> {after_user:.2%}")
+    if not approve_personalization(baseline_val, after_val, baseline_user, after_user):
+        print("SAFEGUARD: candidate model rejected; existing saved model left untouched.")
+        print("Collect more varied, correctly labeled drawings or reduce correction weight.")
+        return
+    # Test images are evaluated only AFTER selection using validation and
+    # correction data; never use the official test set to approve a model.
+    final_test = model.accuracy(data.x_test, data.y_test)
     model.save(args.output, metadata={"dataset":"mnist_28x28", "split_seed":args.seed,
-                                      "test_accuracy":after, "source_model":str(source),
+                                      "test_accuracy":final_test, "source_model":str(source),
                                       "personalized_drawings":len(y_user),
                                       "training_epochs":hist.epochs_completed})
-    print(f"Original MNIST test set: before {baseline:.2%}; after {after:.2%}")
-    print("WARNING: Freehand accuracy must be evaluated on NEW, independently drawn examples.")
-    print(f"Personalized model saved to {args.output}. Run python -m axon demo")
+    print(f"Final official MNIST test accuracy: {final_test:.2%}")
+    print("Freehand accuracy requires NEW independently labeled drawings.")
+    print(f"Accepted personalized model saved to {args.output}.")
+
+
+def approve_personalization(before_val: float, after_val: float,
+                            before_user: float, after_user: float,
+                            tolerance: float = .002) -> bool:
+    """Select candidate using validation plus saved drawings, never test data."""
+    scores = [before_val, after_val, before_user, after_user]
+    if not all(np.isfinite(v) and 0 <= v <= 1 for v in scores):
+        raise ValueError("accuracy measurements must be finite numbers in [0, 1]")
+    if not 0 <= tolerance <= 1:
+        raise ValueError("tolerance must be in [0, 1]")
+    return after_val >= before_val - tolerance and after_user >= before_user
 
 
 def evaluate(args):
@@ -158,15 +181,52 @@ def inspect(args):
 def predict(args):
     from PIL import Image
     from .preprocess import image_to_features
+    from .intelligence import analyze_digit
     model, _ = _model(args.model)
     with Image.open(args.image) as im:
         features = image_to_features(im, size=28 if model.sizes[0] == 784 else 8)
-    if not np.any(features):
-        raise SystemExit("No digit detected")
-    probs = model.predict_proba(features)[0]
-    print(f"Prediction: {probs.argmax()} / softmax score {probs.max():.1%}")
-    print("Scores:", " ".join(f"{i}:{p:.1%}" for i,p in enumerate(probs)))
-    print("Softmax is not a calibrated probability of correctness.")
+    report = analyze_digit(model, features, smart=not args.classic)
+    if report.status == "blank":
+        raise SystemExit("No usable digit detected")
+    print(f"Prediction: {report.digit} / status: {report.status}")
+    print(f"Model score: {report.score:.1%} (not calibrated)")
+    print(f"Consistency: {report.agreement:.0%} / {report.views} views; margin: {report.margin:.1%}")
+    print("Top candidates:", ", ".join(f"{i} ({p:.1%})" for i, p in report.candidates))
+    if report.status == "review":
+        print("REVIEW: This prediction is unreliable; confirm the correct digit.")
+
+
+def audit(args):
+    """Measure clean/shifted accuracy and coverage without tuning on test data."""
+    from .intelligence import predict_views, shift_batch
+    model, path = _model(args.model)
+    data = _data_for_model(model)
+    # Default to validation, never silently use the official held-out test set.
+    x, y = (data.x_test, data.y_test) if args.test else (data.x_val, data.y_val)
+    if args.limit:
+        x, y = x[:args.limit], y[:args.limit]
+    baseline, _, _ = predict_views(model, x, smart=False)
+    enhanced, agreement, views = predict_views(model, x, smart=True)
+    raw = baseline.argmax(axis=1)
+    chosen = enhanced.argmax(axis=1)
+    ordered = np.sort(enhanced, axis=1)
+    accepted = (ordered[:, -1] >= args.min_score) & (
+        ordered[:, -1] - ordered[:, -2] >= args.min_margin) & (agreement >= .6)
+    # Report diagnostics, NOT a promise that the accepted predictions are correct.
+    shifted_x = shift_batch(x, 1, 0, size=28) if model.sizes[0] == 784 else x
+    shifted_raw, _, _ = predict_views(model, shifted_x, smart=False)
+    shifted_smart, _, _ = predict_views(model, shifted_x, smart=True)
+    print(f"AXON / Intelligence audit / {path} / {'TEST' if args.test else 'VALIDATION'} / {len(y)} samples")
+    print(f"Single pass accuracy: {np.mean(raw == y):.2%}")
+    print(f"Multi-view accuracy ({views} views): {np.mean(chosen == y):.2%}")
+    print(f"One-pixel shifted single-pass accuracy: {np.mean(shifted_raw.argmax(axis=1) == y):.2%}")
+    print(f"One-pixel shifted multi-view accuracy: {np.mean(shifted_smart.argmax(axis=1) == y):.2%}")
+    print(f"Reviewed/abstained: {np.mean(~accepted):.2%}; accepted coverage: {np.mean(accepted):.2%}")
+    if accepted.any():
+        print(f"Accuracy among accepted: {np.mean(chosen[accepted] == y[accepted]):.2%} ({accepted.sum()} predictions)")
+    else:
+        print("Accuracy among accepted: no predictions accepted")
+    print("Thresholds are heuristics, not calibrated confidence; freehand input needs separate tests.")
 
 
 def demo(args):
@@ -214,7 +274,15 @@ def main(argv=None):
     a = sub.add_parser("predict")
     a.add_argument("image")
     a.add_argument("--model", default=None)
+    a.add_argument("--classic", action="store_true", help="Use the original single-pass prediction")
     a.set_defaults(handler=predict)
+    a = sub.add_parser("audit", help="Compare classic and smart recognition using a validation split")
+    a.add_argument("--model", default=None)
+    a.add_argument("--limit", type=int, default=1000, help="Number of validation images, 0 for all")
+    a.add_argument("--test", action="store_true", help="Use the held-out test split for final reporting only")
+    a.add_argument("--min-score", type=float, default=.65)
+    a.add_argument("--min-margin", type=float, default=.20)
+    a.set_defaults(handler=audit)
     a = sub.add_parser("personalize", help="Learn from your saved labeled drawings")
     a.add_argument("--model", default=None)
     a.add_argument("--output", default=str(PERSONAL_MODEL))
@@ -228,6 +296,8 @@ def main(argv=None):
     a.add_argument("--seed", type=int, default=42)
     a.set_defaults(handler=xor)
     args = p.parse_args(argv)
+    if getattr(args, "limit", 0) < 0:
+        p.error("--limit must be nonnegative")
     if hasattr(args, "width") and args.width < 4:
         p.error("--width must be >= 4")
     args.handler(args)

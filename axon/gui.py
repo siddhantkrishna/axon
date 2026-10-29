@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw, ImageTk
 
 from .preprocess import image_to_features
 from .corrections import save_correction
+from .intelligence import analyze_digit
 
 BG = "#10151c"
 PANEL = "#1b222c"
@@ -37,6 +38,7 @@ class DigitDrawer:
         self.dataset = None
         self.explorers = []
         self.actual_label = tk.StringVar(value="6")
+        self.smart_mode = tk.BooleanVar(value=self.size == 28)
         self.build()
         self.next_sample()
 
@@ -67,6 +69,11 @@ class DigitDrawer:
         explore = tk.Frame(left, bg=BG)
         explore.pack(fill="x", pady=(10, 0))
         self.button(explore, "VIEW LIVE NEURAL NETWORK  ↗", self.open_explorer, primary=True).pack(side="left")
+        tk.Checkbutton(left, text="SMART INFERENCE (multiple views)", variable=self.smart_mode,
+                       command=self.predict, bg=BG, fg=WHITE, selectcolor=PANEL,
+                       activebackground=BG, activeforeground=WHITE,
+                       font=("Helvetica", 10),
+                       state="normal" if self.size == 28 else "disabled").pack(anchor="w", pady=(12, 0))
         tk.Label(left, text="If AXON guesses wrong, save the correct answer:",
                  font=("Helvetica", 10), bg=BG, fg=MUTED).pack(anchor="w", pady=(19,8))
         corrections = tk.Frame(left, bg=BG)
@@ -97,6 +104,9 @@ class DigitDrawer:
         self.result_score = tk.Label(details, text="Softmax score: —", font=("Helvetica", 10),
                                       bg=PANEL, fg=MUTED)
         self.result_score.pack(anchor="w", pady=(7,0))
+        self.smart_details = tk.Label(details, text="", bg=PANEL, fg=MUTED,
+                                      font=("Helvetica", 10), justify="left")
+        self.smart_details.pack(anchor="w", pady=(6, 0))
         tk.Label(right, text="SOFTMAX OUTPUTS  /  0–9", font=("Helvetica", 10, "bold"),
                  bg=BG, fg=MUTED).pack(anchor="w", pady=(21,10))
         for digit in range(10):
@@ -131,6 +141,7 @@ class DigitDrawer:
         self.result.configure(text="—")
         self.result_caption.configure(text="Awaiting input", fg=WHITE)
         self.result_score.configure(text="Softmax score: —")
+        self.smart_details.configure(text="")
         for bar, val in self.rows:
             bar.delete("all")
             val.configure(text="0.0%")
@@ -182,27 +193,34 @@ class DigitDrawer:
         return self.sample_features if self.sample_features is not None else image_to_features(self.image,size=self.size)
 
     def predict(self):
-        x=self.features()
-        if x.max() < .02:
-            self.result_caption.configure(text="Draw a digit first")
+        x = self.features()
+        report = analyze_digit(self.model, x, smart=self.smart_mode.get())
+        if report.status == "blank":
+            self.result.configure(text="—")
+            self.result_caption.configure(text="Draw a digit first", fg=WHITE)
+            self.result_score.configure(text="No usable digit detected")
+            self.smart_details.configure(text="")
             return
-        probs = self.model.predict_proba(x)[0]
         self._sync_explorers(x)
-        best = int(probs.argmax())
-        ordered = np.sort(probs)
-        uncertain = probs[best] < 0.60 or ordered[-1]-ordered[-2] < 0.2
-        self.result.configure(text=str(best))
-        self.result_caption.configure(text="Uncertain · possible digit" if uncertain else "Predicted digit",
-                                      fg="#f3c67a" if uncertain else WHITE)
-        self.result_score.configure(text=f"Softmax score: {probs[best]:.1%} (not calibrated)")
-        for i,(bar,val) in enumerate(self.rows):
+        best = report.digit
+        self.result.configure(text=str(best) if report.status == "predicted" else "?")
+        self.result_caption.configure(
+            text=f"Possible digit: {best} · check it" if report.status == "review" else "Predicted digit",
+            fg="#f3c67a" if report.status == "review" else WHITE)
+        self.result_score.configure(text=f"Model score: {report.score:.1%} (not calibrated)")
+        alternatives = " / ".join(f"{digit}: {p:.0%}" for digit, p in report.candidates)
+        self.smart_details.configure(text=f"Top candidates: {alternatives}\n"
+                                          f"Consistency: {report.agreement:.0%} over {report.views} view(s)"
+                                          f"  ·  Margin: {report.margin:.0%}")
+        for i, (bar, val) in enumerate(self.rows):
             bar.update_idletasks()
             bar.delete("all")
-            bar.create_rectangle(0,0,max(bar.winfo_width(),100)*float(probs[i]),13,
-                                 fill=BLUE if i==best else "#526e90", outline="")
-            val.configure(text=f"{probs[i]*100:.1f}%")
+            bar.create_rectangle(0, 0, max(bar.winfo_width(), 100) * float(report.probabilities[i]), 13,
+                                 fill=BLUE if i == best else "#526e90", outline="")
+            val.configure(text=f"{report.probabilities[i]*100:.1f}%")
         if self.sample_features is None:
-            self.status.configure(text="FREEHAND / If incorrect, specify actual digit and save the correction")
+            label = "REVIEW SUGGESTED" if report.status == "review" else "PREDICTION READY"
+            self.status.configure(text=f"FREEHAND / {label} / Save labeled corrections to improve personalization")
 
     def open_explorer(self):
         from .neuroviz import open_network_explorer

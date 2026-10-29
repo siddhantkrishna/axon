@@ -156,3 +156,17 @@ The downloaded MNIST data, personal drawing corrections, environment files,
 and personalized/locally trained models are excluded. An original small 8×8
 sample model is included for running the app immediately. GitHub Actions
 runs the unit test suite on pushed commits and pull requests.
+
+
+## v4 — Smarter inference and safer learning
+
+AXON now supports **five-view NumPy inference** for 28×28 models, a top-three
+prediction panel, agreement/margin indicators, a review state for ambiguous
+handwriting, and a classic-versus-smart toggle. The network explorer depicts
+the unshifted pass, while smart predictions combine five passes.
+
+`python -m axon audit` compares clean and shifted accuracy using validation
+data, with an opt-in final test report. `python -m axon personalize` now refuses
+to replace the personalized model when validation accuracy drops materially or
+accuracy on saved corrections decreases. See [INTELLIGENCE.md](INTELLIGENCE.md)
+for methodology, limitations, and commands. No 99.99% accuracy is claimed.

@@ -207,3 +207,82 @@ def test_explorer_rejects_invalid_input():
         neuron_details(net, trace, 1, 500)
     with pytest.raises(ValueError):
         displayed_neurons(np.ones((2, 2)))
+
+
+def test_multiview_translation_does_not_wrap():
+    from axon.intelligence import shift_batch
+    x = np.zeros((2, 784), dtype=np.float32)
+    x[:, 0] = 1
+    shifted = shift_batch(x, 1, 1)
+    assert shifted.shape == (2, 784)
+    assert shifted[:, 29].tolist() == [1.0, 1.0]
+    assert shifted[:, 0].sum() == 0
+    assert shift_batch(x, -1, 0).sum() == 0
+    with pytest.raises(ValueError):
+        shift_batch(x, 28, 0)
+
+
+def test_intelligence_nonblank_and_softmax_consistency():
+    from axon.intelligence import analyze_digit, predict_views
+    net = NeuralNetwork([784, 22, 10], dtype="float32", seed=9)
+    x = np.zeros((1, 784), dtype=np.float32)
+    x[0, 12*28+12:12*28+18] = 1
+    raw = net.predict_proba(x)[0]
+    classic = analyze_digit(net, x, smart=False)
+    np.testing.assert_allclose(classic.probabilities, raw)
+    assert classic.views == 1 and classic.agreement == 1
+    smart = analyze_digit(net, x, smart=True)
+    assert smart.views == 5 and len(smart.candidates) == 3
+    np.testing.assert_allclose(smart.probabilities.sum(), 1, atol=1e-6)
+    assert 0 <= smart.entropy <= 1
+    p, agreements, views = predict_views(net, x, smart=True)
+    np.testing.assert_array_equal(p[0], smart.probabilities)
+    assert agreements[0] == smart.agreement and views == smart.views
+
+
+def test_intelligence_refuses_empty_or_invalid_images():
+    from axon.intelligence import analyze_digit
+    net = NeuralNetwork([784, 16, 10])
+    assert analyze_digit(net, np.zeros((1, 784))).status == "blank"
+    assert analyze_digit(net, np.eye(1, 784)).status == "blank"
+    with pytest.raises(ValueError):
+        analyze_digit(net, np.full((1, 784), np.nan))
+    with pytest.raises(ValueError):
+        analyze_digit(net, np.ones((2, 784)))
+    with pytest.raises(ValueError):
+        analyze_digit(net, np.ones((1, 784)), min_score=2)
+
+
+def test_intelligence_legacy_model_uses_single_pass():
+    from axon.intelligence import analyze_digit, predict_views
+    net = NeuralNetwork([64, 32, 10], seed=4)
+    x = np.zeros((2, 64))
+    x[:, 23:30] = 1
+    p, agreements, views = predict_views(net, x, smart=True)
+    assert views == 1
+    np.testing.assert_allclose(p, net.predict_proba(x))
+    np.testing.assert_array_equal(agreements, [1.0, 1.0])
+    assert analyze_digit(net, x[:1], smart=True).views == 1
+
+
+def test_intelligence_agreement_flags_conflicting_views():
+    from axon.intelligence import analyze_digit
+    net = NeuralNetwork([784, 10], l2=0, seed=1)
+    net.weights[0][:] = 0
+    net.biases[0][:] = 0
+    net.weights[0][14*28+14, 0] = 8
+    net.weights[0][14*28+13, 1] = 8
+    net.weights[0][14*28+15, 2] = 8
+    x = np.zeros((1, 784)); x[0,14*28+14] = 1; x[0,14*28+15] = 1; x[0,14*28+16] = 1
+    report = analyze_digit(net, x, smart=True, min_score=0, min_margin=0, min_agreement=1)
+    assert report.status == "review"
+    assert report.agreement < 1
+
+
+def test_personalization_guard_avoids_regressions():
+    from axon.cli import approve_personalization
+    assert approve_personalization(.98, .981, .65, .85)
+    assert not approve_personalization(.98, .96, .65, .95)
+    assert not approve_personalization(.98, .99, .80, .60)
+    with pytest.raises(ValueError):
+        approve_personalization(.98, float("nan"), .5, .5)
